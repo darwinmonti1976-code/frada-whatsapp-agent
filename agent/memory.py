@@ -64,6 +64,18 @@ class Mensaje(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
 
 
+class EstadoConversacion(Base):
+    """
+    Hasta cuando el agente esta pausado en una conversacion, porque alguien del
+    equipo la tomo a mano (modo coexistencia con la WhatsApp Business App).
+    """
+
+    __tablename__ = "estados_conversacion"
+
+    telefono: Mapped[str] = mapped_column(String(50), primary_key=True)
+    pausado_hasta: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class EventoProcesado(Base):
     """
     Eventos de webhook que ya se atendieron.
@@ -131,6 +143,37 @@ async def limpiar_eventos_viejos(dias: int = 7):
         logger.info(f"Se limpiaron {resultado.rowcount} eventos de mas de {dias} dias")
 
 
+async def pausar_agente(telefono: str, horas: int = 24):
+    """
+    Pausa al agente en esta conversacion: alguien del equipo la tomo a mano desde
+    la app de WhatsApp Business. Cada respuesta manual reinicia el timer, asi el
+    agente no interrumpe mientras el equipo sigue activo en el chat.
+    """
+    limite = ahora() + timedelta(hours=horas)
+    async with async_session() as session:
+        estado = await session.get(EstadoConversacion, telefono)
+        if estado:
+            estado.pausado_hasta = limite
+        else:
+            session.add(EstadoConversacion(telefono=telefono, pausado_hasta=limite))
+        await session.commit()
+
+
+async def esta_pausado(telefono: str) -> bool:
+    """True si el agente esta pausado en esta conversacion ahora mismo."""
+    async with async_session() as session:
+        estado = await session.get(EstadoConversacion, telefono)
+    if estado is None:
+        return False
+    # SQLite no preserva la zona horaria al guardar: lo que se lee de vuelta viene
+    # "naive" aunque se haya guardado con tz. Sin esto, comparar contra ahora()
+    # (que si tiene tz) tira TypeError. Postgres si la preserva, asi que aca no hace nada.
+    limite = estado.pausado_hasta
+    if limite.tzinfo is None:
+        limite = limite.replace(tzinfo=timezone.utc)
+    return limite > ahora()
+
+
 async def guardar_mensaje(telefono: str, role: str, content: str):
     """Guarda un mensaje en el historial de esa conversacion."""
     async with async_session() as session:
@@ -156,12 +199,17 @@ async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
 
     mensajes.reverse()  # vienen del mas nuevo al mas viejo: los damos vuelta
 
-    # La API de Claude exige que el historial empiece con un mensaje del usuario.
-    # Si por un error anterior quedo un "assistant" suelto al principio, lo sacamos.
-    while mensajes and mensajes[0].role != "user":
-        mensajes.pop(0)
+    historial = [{"role": m.role, "content": m.content} for m in mensajes]
 
-    return [{"role": m.role, "content": m.content} for m in mensajes]
+    # La API de Claude exige que el historial empiece con un mensaje del usuario.
+    # Puede pasar que el primer turno guardado sea "assistant" (por ejemplo, una
+    # respuesta manual del equipo cuando el primer envio del agente fallo y no se
+    # guardo). En vez de descartarla —perdiendo contexto real de la conversacion—
+    # se antepone un turno de usuario vacio para cumplir el requisito de la API.
+    if historial and historial[0]["role"] != "user":
+        historial.insert(0, {"role": "user", "content": "..."})
+
+    return historial
 
 
 async def limpiar_historial(telefono: str):

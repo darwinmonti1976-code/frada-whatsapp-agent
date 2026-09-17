@@ -16,7 +16,7 @@ import os
 import httpx
 from fastapi import Request
 
-from agent.providers.base import MensajeEntrante, ProveedorWhatsApp
+from agent.providers.base import MensajeEntrante, ProveedorWhatsApp, RespuestaManual
 
 logger = logging.getLogger("agentkit")
 
@@ -116,6 +116,38 @@ class ProveedorZernio(ProveedorWhatsApp):
                 },
             )
         ]
+
+    # ── Coexistencia con la WhatsApp Business App ───────────────────────
+
+    async def detectar_respuesta_manual(self, request: Request) -> RespuestaManual | None:
+        """
+        En modo coexistencia, cuando alguien del equipo responde a mano desde la
+        app de WhatsApp Business, Zernio manda un evento "message.sent" con
+        source="whatsapp_business_app" (distinto de "cloud_api", que es lo que
+        manda nuestro propio envio via API). Lo usamos como señal de que un
+        humano tomo la conversacion.
+
+        Ojo: el numero del cliente en un evento saliente NO viene en
+        message.sender (ese es el negocio, y suele venir vacio) — viene en
+        conversation.participantId.
+        """
+        payload = await request.json()
+
+        if payload.get("event") != "message.sent":
+            return None
+
+        mensaje = payload.get("message") or {}
+        if mensaje.get("source") != "whatsapp_business_app":
+            return None  # es nuestro propio envio via API, o via broadcast, etc.
+
+        conversacion = payload.get("conversation") or {}
+        telefono = (conversacion.get("participantId") or "").lstrip("+")
+        texto = mensaje.get("text") or ""
+
+        if not telefono or not texto.strip():
+            return None
+
+        return RespuestaManual(telefono=telefono, texto=texto)
 
     # ── Enviar ───────────────────────────────────────────────────────────
 

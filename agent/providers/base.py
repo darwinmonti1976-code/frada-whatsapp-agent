@@ -27,6 +27,18 @@ class MensajeEntrante:
     #   account_id      -> Zernio: que cuenta de WhatsApp recibio el mensaje
 
 
+@dataclass
+class RespuestaManual:
+    """
+    Alguien del equipo respondio a mano (no via la API) en un numero en modo
+    coexistencia. Se usa para pausar al agente en esa conversacion: si un humano
+    esta escribiendo, el agente no debe contestar por encima.
+    """
+
+    telefono: str
+    texto: str
+
+
 class ProveedorWhatsApp(ABC):
     """Interfaz que cada proveedor de WhatsApp debe implementar."""
 
@@ -56,3 +68,11 @@ class ProveedorWhatsApp(ABC):
     async def verificar_conexion(self) -> tuple[bool, str]:
         """Chequea que las credenciales sirvan. Retorna (ok, mensaje_legible)."""
         return True, "Este proveedor no expone un chequeo de conexion"
+
+    async def detectar_respuesta_manual(self, request: Request) -> RespuestaManual | None:
+        """
+        Si el webhook trae una respuesta escrita a mano por el equipo (no por el
+        agente), la retorna. Por defecto ningun proveedor la soporta; Zernio la
+        implementa para su modo de coexistencia con la WhatsApp Business App.
+        """
+        return None

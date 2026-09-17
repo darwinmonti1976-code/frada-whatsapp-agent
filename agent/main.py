@@ -26,15 +26,17 @@ from fastapi.responses import PlainTextResponse
 
 from agent.brain import generar_respuesta, obtener_mensaje_error
 from agent.memory import (
+    esta_pausado,
     guardar_mensaje,
     inicializar_db,
     liberar_evento,
     limpiar_eventos_viejos,
     marcar_evento_procesado,
     obtener_historial,
+    pausar_agente,
 )
 from agent.providers import obtener_proveedor
-from agent.providers.base import MensajeEntrante
+from agent.providers.base import MensajeEntrante, RespuestaManual
 
 load_dotenv()
 
@@ -148,6 +150,19 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
     if not await proveedor.verificar_firma(request):
         raise HTTPException(status_code=401, detail="Firma del webhook invalida")
 
+    # Modo coexistencia: si alguien del equipo respondio a mano desde la app de
+    # WhatsApp Business, pausamos al agente en esa conversacion en vez de procesar
+    # el evento como un mensaje entrante de cliente.
+    try:
+        respuesta_manual = await proveedor.detectar_respuesta_manual(request)
+    except Exception as e:  # noqa: BLE001
+        respuesta_manual = None
+        logger.error(f"No se pudo leer el webhook como respuesta manual: {e}")
+
+    if respuesta_manual is not None:
+        tareas.add_task(procesar_respuesta_manual, respuesta_manual)
+        return {"status": "ok", "pausado": True}
+
     try:
         mensajes = await proveedor.parsear_webhook(request)
     except Exception as e:  # noqa: BLE001
@@ -173,6 +188,18 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
     return {"status": "ok", "encolados": encolados}
 
 
+async def procesar_respuesta_manual(respuesta: RespuestaManual):
+    """
+    Registra una respuesta que el equipo escribio a mano y pausa al agente en esa
+    conversacion. Se guarda en el historial como turno del asistente para que,
+    cuando el agente retome, tenga el contexto completo de lo que ya se hablo.
+    """
+    async with _candados[respuesta.telefono]:
+        await pausar_agente(respuesta.telefono)
+        await guardar_mensaje(respuesta.telefono, "assistant", respuesta.texto)
+    logger.info(f"Respuesta manual de {respuesta.telefono}: agente pausado 24h")
+
+
 async def procesar_mensaje(msg: MensajeEntrante):
     """
     Genera la respuesta y la manda de vuelta. Corre fuera del ciclo del webhook.
@@ -184,6 +211,13 @@ async def procesar_mensaje(msg: MensajeEntrante):
 
     async with _candados[msg.telefono]:
         try:
+            if await esta_pausado(msg.telefono):
+                # Un humano esta atendiendo esta conversacion a mano: guardamos el
+                # mensaje del cliente para no perder contexto, pero no respondemos.
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                logger.info(f"Agente pausado para {msg.telefono}: mensaje guardado, no se responde")
+                return
+
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
             historial = await obtener_historial(msg.telefono)

@@ -12,7 +12,7 @@ negocio:
   horario: "Lun-Jeu 8h30-18h30, Ven 8h30-20h00, Sam 8h00-17h00, Dim fermé"
 
 agente:
-  nombre: "Frada"
+  nombre: "Adèle"
   tono: "empático y cálido"
   idioma: "francés"
   casos_de_uso:
