@@ -172,13 +172,21 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
     encolados = 0
     for msg in mensajes:
-        if msg.es_propio or not msg.texto.strip():
+        if msg.es_propio:
             continue
 
         # La entrega es "al menos una vez": el mismo evento puede llegar dos veces
         evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
         if evento_id and not await marcar_evento_procesado(evento_id):
             logger.info(f"Evento repetido, se ignora: {evento_id}")
+            continue
+
+        # Audio, imagen, video, sticker...: llegan sin texto. Claude no los puede
+        # leer, asi que se contesta con un aviso fijo en vez de ignorarlos.
+        if not msg.texto.strip():
+            logger.info(f"Mensaje sin texto de {msg.telefono} (audio, imagen, etc.)")
+            tareas.add_task(procesar_mensaje_sin_texto, msg)
+            encolados += 1
             continue
 
         logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
@@ -198,6 +206,43 @@ async def procesar_respuesta_manual(respuesta: RespuestaManual):
         await pausar_agente(respuesta.telefono)
         await guardar_mensaje(respuesta.telefono, "assistant", respuesta.texto)
     logger.info(f"Respuesta manual de {respuesta.telefono}: agente pausado 24h")
+
+
+MENSAJE_SIN_TEXTO = (
+    "Bonjour, je suis Adèle, l'assistante virtuelle (intelligence artificielle) de "
+    "Frada Skin Center. Je ne peux pas écouter les messages vocaux ni voir les pièces "
+    "jointes, mais notre équipe en prendra connaissance dès que possible. Pour une "
+    "réponse immédiate, n'hésitez pas à m'écrire votre question par message."
+)
+
+
+async def procesar_mensaje_sin_texto(msg: MensajeEntrante):
+    """
+    Contesta con un aviso fijo a los mensajes sin texto (audios, fotos, videos...).
+
+    El aviso NO se guarda en el historial: no es un turno de conversacion. Si un
+    humano tiene la conversacion en pausa, no se responde nada.
+    """
+    evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
+
+    async with _candados[msg.telefono]:
+        try:
+            if await esta_pausado(msg.telefono):
+                logger.info(f"Agente pausado para {msg.telefono}: mensaje sin texto, no se responde")
+                return
+
+            if not await proveedor.enviar_mensaje(msg.telefono, MENSAJE_SIN_TEXTO, msg.contexto):
+                # Igual que en procesar_mensaje: se suelta el evento para que el
+                # reintento del proveedor si se procese.
+                logger.error(f"No se pudo enviar el aviso a {msg.telefono}; se libera el evento")
+                await liberar_evento(evento_id)
+                return
+
+            logger.info(f"Aviso de mensaje sin texto enviado a {msg.telefono}")
+
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"Error procesando el mensaje sin texto de {msg.telefono}: {e}")
+            await liberar_evento(evento_id)
 
 
 async def procesar_mensaje(msg: MensajeEntrante):
