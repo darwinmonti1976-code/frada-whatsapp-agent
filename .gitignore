@@ -15,6 +15,7 @@ venv/
 # Knowledge (archivos privados del negocio)
 knowledge/*
 !knowledge/.gitkeep
+!knowledge/frada-services.md
 
 # Session state
 config/session.yaml

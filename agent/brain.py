@@ -8,6 +8,8 @@ respuestas con la API de Anthropic.
 
 import logging
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import yaml
 from anthropic import AsyncAnthropic
@@ -50,11 +52,32 @@ def cargar_config_prompts() -> dict:
         return {}
 
 
+# Nombres en frances escritos a mano: no dependemos de que el contenedor tenga
+# el locale fr_CH instalado (en Railway no lo tiene).
+_DIAS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_MESES_FR = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+
+def fecha_hora_actual() -> str:
+    """Fecha y hora actuales en Suiza, en frances, para que Adele sepa que dia es."""
+    ahora = datetime.now(ZoneInfo("Europe/Zurich"))
+    dia = "1er" if ahora.day == 1 else str(ahora.day)
+    return (
+        f"Nous sommes le {_DIAS_FR[ahora.weekday()]} {dia} {_MESES_FR[ahora.month - 1]} "
+        f"{ahora.year}, il est {ahora.hour}h{ahora.minute:02d} (heure de Martigny)."
+    )
+
+
 def cargar_system_prompt() -> str:
-    """El system prompt: quien es el agente y que sabe del negocio."""
-    return cargar_config_prompts().get(
+    """El system prompt: quien es el agente y que sabe del negocio, mas la fecha de hoy."""
+    prompt = cargar_config_prompts().get(
         "system_prompt", "Eres un asistente util. Responde siempre en espanol."
     )
+    # Se calcula en cada mensaje (no al arrancar): el servidor corre dias seguidos.
+    return f"{prompt.rstrip()}\n\n{fecha_hora_actual()}"
 
 
 def obtener_mensaje_error() -> str:
