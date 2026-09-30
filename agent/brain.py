@@ -139,7 +139,9 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
     """
     global _soporta_esfuerzo
 
-    if not mensaje or len(mensaje.strip()) < 2:
+    # Sin minimo de largo: un emoji solo (un corazon, un pulgar) es un mensaje valido
+    # y Claude sabe contestarlo. Solo se descarta lo que llega vacio.
+    if not mensaje or not mensaje.strip():
         return obtener_mensaje_fallback(), False
 
     mensajes = [{"role": m["role"], "content": m["content"]} for m in historial]

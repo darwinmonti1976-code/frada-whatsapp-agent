@@ -60,6 +60,14 @@ PORT = int(os.getenv("PORT", "8000"))
 # en paralelo, los dos leerian el mismo historial y las escrituras quedarian intercaladas.
 _candados: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+# Muchas clientes escriben en varios mensajes seguidos ("hola", "una pregunta",
+# "cuanto cuesta el laser?"). En vez de contestar a cada uno, se espera
+# DEBOUNCE_SECONDS: si llega otro mensaje del mismo numero, la espera vuelve a
+# empezar. Al final se manda todo junto a Claude y sale UNA sola respuesta.
+DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS") or "10")
+_pendientes: dict[str, list[MensajeEntrante]] = defaultdict(list)
+_temporizadores: dict[str, asyncio.Task] = {}
+
 # Si la configuracion esta mal, guardamos el error y lo mostramos en el health check,
 # en vez de reventar en el import y dejar a Railway reiniciando el contenedor a ciegas.
 proveedor = None
@@ -190,7 +198,7 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
             continue
 
         logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
-        tareas.add_task(procesar_mensaje, msg)
+        agrupar_mensaje(msg)
         encolados += 1
 
     return {"status": "ok", "encolados": encolados}
@@ -232,7 +240,7 @@ async def procesar_mensaje_sin_texto(msg: MensajeEntrante):
                 return
 
             if not await proveedor.enviar_mensaje(msg.telefono, MENSAJE_SIN_TEXTO, msg.contexto):
-                # Igual que en procesar_mensaje: se suelta el evento para que el
+                # Igual que en procesar_mensajes: se suelta el evento para que el
                 # reintento del proveedor si se procese.
                 logger.error(f"No se pudo enviar el aviso a {msg.telefono}; se libera el evento")
                 await liberar_evento(evento_id)
@@ -245,53 +253,99 @@ async def procesar_mensaje_sin_texto(msg: MensajeEntrante):
             await liberar_evento(evento_id)
 
 
-async def procesar_mensaje(msg: MensajeEntrante):
+def agrupar_mensaje(msg: MensajeEntrante):
     """
-    Genera la respuesta y la manda de vuelta. Corre fuera del ciclo del webhook.
+    Suma el mensaje al grupo pendiente de ese numero y reinicia la espera.
 
-    Se toma un candado por telefono: dos mensajes seguidos del mismo cliente se
-    atienden en orden, no en paralelo, para que el historial no se mezcle.
+    Si ya habia un temporizador corriendo para ese numero, se cancela: la espera de
+    DEBOUNCE_SECONDS vuelve a contar desde el ultimo mensaje.
     """
-    evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
+    _pendientes[msg.telefono].append(msg)
 
-    async with _candados[msg.telefono]:
+    anterior = _temporizadores.get(msg.telefono)
+    if anterior is not None:
+        anterior.cancel()
+
+    _temporizadores[msg.telefono] = asyncio.create_task(_esperar_y_procesar(msg.telefono))
+
+
+async def _esperar_y_procesar(telefono: str):
+    """Espera a que la cliente deje de escribir y procesa todo el grupo junto."""
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return  # llego otro mensaje: el nuevo temporizador se encarga del grupo
+
+    # Entre el fin de la espera y estas dos lineas no hay ningun await, asi que nadie
+    # puede meterse en el medio. Sacar el temporizador del dict ANTES de procesar es
+    # clave: si llega un mensaje mientras se llama a Claude, arranca un grupo nuevo
+    # en vez de cancelar esta tarea a mitad de camino.
+    _temporizadores.pop(telefono, None)
+    grupo = _pendientes.pop(telefono, [])
+    if grupo:
+        await procesar_mensajes(grupo)
+
+
+async def procesar_mensajes(grupo: list[MensajeEntrante]):
+    """
+    Genera UNA respuesta para un grupo de mensajes seguidos del mismo numero y la
+    manda de vuelta. Corre fuera del ciclo del webhook.
+
+    Se toma un candado por telefono: si llega un grupo nuevo mientras se contesta el
+    anterior, espera su turno, para que el historial no se mezcle.
+    """
+    ultimo = grupo[-1]
+    telefono = ultimo.telefono
+    texto = "\n".join(m.texto.strip() for m in grupo)
+    eventos = [m.contexto.get("evento_id") or m.mensaje_id for m in grupo]
+
+    async def liberar_eventos():
+        for evento_id in eventos:
+            await liberar_evento(evento_id)
+
+    if len(grupo) > 1:
+        logger.info(f"{len(grupo)} mensajes de {telefono} agrupados en uno")
+
+    async with _candados[telefono]:
         try:
-            if await esta_pausado(msg.telefono):
+            if await esta_pausado(telefono):
                 # Un humano esta atendiendo esta conversacion a mano: guardamos el
                 # mensaje del cliente para no perder contexto, pero no respondemos.
-                await guardar_mensaje(msg.telefono, "user", msg.texto)
-                logger.info(f"Agente pausado para {msg.telefono}: mensaje guardado, no se responde")
+                await guardar_mensaje(telefono, "user", texto)
+                logger.info(f"Agente pausado para {telefono}: mensaje guardado, no se responde")
                 return
 
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
-            historial = await obtener_historial(msg.telefono)
-            respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial)
+            historial = await obtener_historial(telefono)
+            respuesta, es_respuesta_real = await generar_respuesta(texto, historial)
 
-            enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta, msg.contexto)
+            # Se responde con el contexto del ultimo mensaje: es la misma conversacion,
+            # y su evento_id da una Idempotency-Key unica para este grupo.
+            enviado = await proveedor.enviar_mensaje(telefono, respuesta, ultimo.contexto)
 
             if not enviado:
-                # El evento se marco como procesado ANTES de llegar hasta aca, para que dos
-                # entregas simultaneas no se dupliquen. Si el envio fallo, hay que soltarlo:
-                # si no, el reintento del proveedor se descartaria por duplicado y el cliente
-                # se quedaria sin respuesta para siempre.
-                logger.error(f"No se pudo enviar la respuesta a {msg.telefono}; se libera el evento")
-                await liberar_evento(evento_id)
+                # Los eventos se marcaron como procesados ANTES de llegar hasta aca, para
+                # que dos entregas simultaneas no se dupliquen. Si el envio fallo, hay que
+                # soltarlos: si no, el reintento del proveedor se descartaria por duplicado
+                # y el cliente se quedaria sin respuesta para siempre.
+                logger.error(f"No se pudo enviar la respuesta a {telefono}; se liberan los eventos")
+                await liberar_eventos()
                 return
 
             # Solo se guarda en el historial lo que de verdad es conversacion. Los avisos
             # tecnicos ("estoy teniendo problemas") no son un turno del agente: guardarlos
             # los deja contaminando el contexto de todos los mensajes que vengan despues.
             if es_respuesta_real:
-                await guardar_mensaje(msg.telefono, "user", msg.texto)
-                await guardar_mensaje(msg.telefono, "assistant", respuesta)
+                await guardar_mensaje(telefono, "user", texto)
+                await guardar_mensaje(telefono, "assistant", respuesta)
 
-            logger.info(f"Respuesta enviada a {msg.telefono}: {respuesta}")
+            logger.info(f"Respuesta enviada a {telefono}: {respuesta}")
 
         except Exception as e:  # noqa: BLE001
-            logger.exception(f"Error procesando el mensaje de {msg.telefono}: {e}")
-            await liberar_evento(evento_id)
+            logger.exception(f"Error procesando los mensajes de {telefono}: {e}")
+            await liberar_eventos()
             try:
-                await proveedor.enviar_mensaje(msg.telefono, obtener_mensaje_error(), msg.contexto)
+                await proveedor.enviar_mensaje(telefono, obtener_mensaje_error(), ultimo.contexto)
             except Exception:  # noqa: BLE001
                 logger.error("Tampoco se pudo avisarle al cliente del error")
