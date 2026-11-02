@@ -121,13 +121,25 @@ def _es_error_de_esfuerzo(error: Exception) -> bool:
     return "output_config" in texto or "effort" in texto
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, bool]:
+PRESENTACION_OBLIGATORIA = (
+    "NOUVELLE CONVERSATION : la cliente n'a pas écrit depuis plus de 12 heures (ou "
+    "c'est son premier message). Ta réponse DOIT commencer par te présenter : "
+    "« Je suis Adèle, l'assistante virtuelle (IA) de Frada Skin Center. », puis "
+    "réponds normalement à son message."
+)
+
+
+async def generar_respuesta(
+    mensaje: str, historial: list[dict], presentarse: bool = False
+) -> tuple[str, bool]:
     """
     Genera una respuesta con Claude.
 
     Args:
         mensaje: el mensaje nuevo del cliente
         historial: los mensajes anteriores, [{"role": "user"|"assistant", "content": "..."}]
+        presentarse: True al empezar una conversacion nueva; obliga a Adele a
+            presentarse (nombre + IA) aunque el historial viejo ya tenga una presentacion
 
     Returns:
         (texto, es_respuesta_real)
@@ -148,6 +160,8 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
     mensajes.append({"role": "user", "content": mensaje})
 
     system_prompt = cargar_system_prompt()
+    if presentarse:
+        system_prompt = f"{system_prompt}\n\n{PRESENTACION_OBLIGATORIA}"
     extras = {"output_config": {"effort": ESFUERZO}} if (_soporta_esfuerzo and ESFUERZO) else {}
 
     async def _llamar(parametros_extra: dict):

@@ -181,6 +181,31 @@ async def guardar_mensaje(telefono: str, role: str, content: str):
         await session.commit()
 
 
+async def es_conversacion_nueva(telefono: str, horas: int = 12) -> bool:
+    """
+    True si no hubo ningun mensaje con este numero en las ultimas N horas.
+
+    Sirve para que Adele se presente al empezar cada conversacion, aunque la
+    clienta ya le haya escrito dias atras: el historial guardado no alcanza para
+    saberlo, porque tiene mensajes viejos en los que ya se presento.
+    """
+    async with async_session() as session:
+        resultado = await session.execute(
+            select(Mensaje.timestamp)
+            .where(Mensaje.telefono == telefono)
+            .order_by(Mensaje.id.desc())
+            .limit(1)
+        )
+        ultimo = resultado.scalar_one_or_none()
+
+    if ultimo is None:
+        return True
+    # SQLite devuelve la fecha sin zona horaria aunque se haya guardado en UTC
+    if ultimo.tzinfo is None:
+        ultimo = ultimo.replace(tzinfo=timezone.utc)
+    return ahora() - ultimo > timedelta(hours=horas)
+
+
 async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
     """
     Devuelve los ultimos N mensajes de una conversacion, en orden cronologico.

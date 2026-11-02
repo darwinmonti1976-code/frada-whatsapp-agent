@@ -26,6 +26,7 @@ from fastapi.responses import PlainTextResponse
 
 from agent.brain import generar_respuesta, obtener_mensaje_error
 from agent.memory import (
+    es_conversacion_nueva,
     esta_pausado,
     guardar_mensaje,
     inicializar_db,
@@ -318,7 +319,10 @@ async def procesar_mensajes(grupo: list[MensajeEntrante]):
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
             historial = await obtener_historial(telefono)
-            respuesta, es_respuesta_real = await generar_respuesta(texto, historial)
+            presentarse = await es_conversacion_nueva(telefono)
+            respuesta, es_respuesta_real = await generar_respuesta(
+                texto, historial, presentarse=presentarse
+            )
 
             # Se responde con el contexto del ultimo mensaje: es la misma conversacion,
             # y su evento_id da una Idempotency-Key unica para este grupo.
